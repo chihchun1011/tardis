@@ -3,6 +3,7 @@ from ...interfaces.batchsystemadapter import BatchSystemAdapter, MachineStatus
 from ...utilities.asynccachemap import AsyncCacheMap
 from ...utilities.executors.shellexecutor import ShellExecutor
 
+import hashlib
 import logging
 import asyncio
 from typing import Iterable
@@ -31,7 +32,17 @@ class TritonAdapter(BatchSystemAdapter):
           triton_metrics_port: 8002
           options:
             pool: c03-001-151.gridka.de
+
+    triton_http_port/triton_metrics_port are BASE ports, not literal ones.
+    Multiple pilots can land on the same GPU node, so each drone's actual
+    ports are base + a stable per-drone offset derived from its
+    TardisDroneUuid (see _port_offset). start_pilot.sh derives the same
+    offset from the same UUID to pick tritonserver's --http-port/
+    --grpc-port/--metrics-port, so the two sides always agree without any
+    extra coordination.
     """
+
+    PORT_OFFSET_RANGE = 10000
 
     def __init__(self):
         config = Configuration()
@@ -47,6 +58,14 @@ class TritonAdapter(BatchSystemAdapter):
         self._http_port = getattr(config.BatchSystem, "triton_http_port", 8000)
         self._metrics_port = getattr(config.BatchSystem, "triton_metrics_port", 8002)
         max_age = getattr(config.BatchSystem, "max_age", 1)  # minutes
+
+        # Testing-only escape hatch: if set, get_utilisation() reads a float
+        # from this file instead of querying Triton's real /metrics, so
+        # scale-up/scale-down can be driven by hand (e.g. `echo 0.95 > file`)
+        # without needing real inference traffic. Leave unset for production.
+        self._simulated_utilisation_file = getattr(
+            config.BatchSystem, "simulated_utilisation_file", None
+        )
 
         # Cache: drone_uuid → hostname string
         # Re-queried at most every max_age minutes
@@ -123,6 +142,17 @@ class TritonAdapter(BatchSystemAdapter):
         await self._host_cache.update_status()
         return self._host_cache.get(drone_uuid)
 
+    @classmethod
+    def _port_offset(cls, drone_uuid: str) -> int:
+        """
+        Stable per-drone port offset derived from drone_uuid, so multiple
+        Triton pilots landing on the same node don't collide on the same
+        ports. Must match the offset start_pilot.sh derives for
+        --http-port/--grpc-port/--metrics-port.
+        """
+        digest = hashlib.md5(drone_uuid.encode()).hexdigest()[:8]
+        return int(digest, 16) % cls.PORT_OFFSET_RANGE
+
     # ------------------------------------------------------------------
     # Step 2: BatchSystemAdapter interface implementation
     # ------------------------------------------------------------------
@@ -137,12 +167,24 @@ class TritonAdapter(BatchSystemAdapter):
           - utilisation < low_utilisation  → scale down (drone underused)
           - utilisation > high_allocation  → scale up   (drone overloaded)
         """
+        if self._simulated_utilisation_file is not None:
+            try:
+                with open(self._simulated_utilisation_file) as f:
+                    simulated = float(f.read().strip())
+                logger.debug(f"Using simulated utilisation {simulated} for {drone_uuid}")
+                return simulated
+            except (OSError, ValueError) as e:
+                logger.debug(
+                    f"Could not read simulated utilisation from "
+                    f"{self._simulated_utilisation_file}: {e}, falling back to real metrics"
+                )
+
         host = await self._get_host(drone_uuid)
         if host is None:
             logger.debug(f"No host found for {drone_uuid}, returning utilisation 0.0")
             return 0.0
 
-        url = f"http://{host}:{self._metrics_port}/metrics"
+        url = f"http://{host}:{self._metrics_port + self._port_offset(drone_uuid)}/metrics"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -163,7 +205,7 @@ class TritonAdapter(BatchSystemAdapter):
         if host is None:
             return 0.0
 
-        url = f"http://{host}:{self._http_port}/v2/health/ready"
+        url = f"http://{host}:{self._http_port + self._port_offset(drone_uuid)}/v2/health/ready"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
