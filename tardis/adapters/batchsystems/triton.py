@@ -74,16 +74,24 @@ class TritonAdapter(BatchSystemAdapter):
             max_age=max_age * 60,
         )
 
-    # ------------------------------------------------------------------
-    # Step 3: Map drone_uuid → hostname via condor_q
-    # This is the update function for the AsyncCacheMap above.
-    # It runs condor_q ONCE and builds a full {drone_uuid: host} dict,
-    # rather than one condor_q call per drone (which would be slow).
-    # ------------------------------------------------------------------
+        # drone_uuids that drain_machine() has been called for. Triton has
+        # no graceful-drain protocol to wait on, so once a drone lands here
+        # get_machine_status() reports it Drained immediately - otherwise
+        # it would keep reporting Available forever (Triton stays healthy)
+        # and DrainingState would bounce back to DrainState in an infinite
+        # loop, never reaching DisintegrateState/CleanupState/condor_rm.
+        self._draining: set[str] = set()
+
     async def _update_host_cache(self) -> dict:
         """
-        Query condor_q for ALL running Triton pilot jobs at once.
-        Returns {drone_uuid: hostname} for every job that has a RemoteHost.
+        This is the update function for the AsyncCacheMap above.
+         Map drone_uuid → hostname via condor_q
+
+        Query condor_q once for every currently-running Triton pilot job,
+        rebuilding the full {drone_uuid: hostname} map from scratch - not a
+        one-off snapshot. This is the update_coroutine of an AsyncCacheMap,
+        so it re-runs on demand (throttled by max_age) whenever any drone
+        calls _get_host().
 
         TardisDroneUuid is not a job ClassAd — TARDIS only injects it as a
         "TardisDroneUuid=<uuid>" entry inside the job's Environment ClassAd
@@ -97,8 +105,7 @@ class TritonAdapter(BatchSystemAdapter):
             f"-constraint 'IsTardisPilot =?= true' "
             f"-af Environment RemoteHost"
             # Output format per line (Environment is itself space-separated
-            # VAR=VALUE pairs, condor normalizes it to this form regardless
-            # of submit-side syntax) - RemoteHost is always the last token:
+            # VAR=VALUE pairs) - RemoteHost is always the last token:
             # "TardisDroneCores=3 TardisDroneDisk=40 TardisDroneMemory=16 \
             #  TardisDroneUuid=tritongpu-01fc0022f7 slot1@gpu-node-42.gridka.de"
         )
@@ -154,7 +161,7 @@ class TritonAdapter(BatchSystemAdapter):
         return int(digest, 16) % cls.PORT_OFFSET_RANGE
 
     # ------------------------------------------------------------------
-    # Step 2: BatchSystemAdapter interface implementation
+    # BatchSystemAdapter interface implementation
     # ------------------------------------------------------------------
 
     async def get_utilisation(self, drone_uuid: str) -> float:
@@ -217,9 +224,13 @@ class TritonAdapter(BatchSystemAdapter):
     async def get_machine_status(self, drone_uuid: str) -> MachineStatus:
         """
         Map Triton health → TARDIS MachineStatus:
-          /v2/health/ready == 200  →  Available
-          anything else            →  NotAvailable
+          already draining          →  Drained (nothing to wait for)
+          /v2/health/ready == 200   →  Available
+          anything else             →  NotAvailable
         """
+        if drone_uuid in self._draining:
+            return MachineStatus.Drained
+
         allocation = await self.get_allocation(drone_uuid)
         if allocation == 1.0:
             return MachineStatus.Available
@@ -230,14 +241,24 @@ class TritonAdapter(BatchSystemAdapter):
         return
 
     async def disintegrate_machine(self, drone_uuid: str) -> None:
-        """No disintegration step needed — TARDIS will condor_rm the job."""
-        return
+        """
+        No disintegration step needed — TARDIS will condor_rm the job.
+        Drop the drone from _draining here: this is the last point in the
+        drone's lifecycle where get_machine_status() is still consulted
+        (ShutDownState/ShuttingDownState/CleanupState never call it again),
+        so it's safe to stop tracking it and avoid leaking one entry per
+        drained drone for the life of the process.
+        """
+        self._draining.discard(drone_uuid)
 
     async def drain_machine(self, drone_uuid: str) -> None:
         """
-        Triton has no drain concept. Returning here means TARDIS will
-        move directly to termination (condor_rm) when it wants to remove a drone.
+        Triton has no drain concept, so there's nothing to wait for - mark
+        the drone as drained immediately so get_machine_status() reports
+        MachineStatus.Drained and TARDIS proceeds straight to termination
+        (condor_rm) on its next check.
         """
+        self._draining.add(drone_uuid)
         return
 
     @property
