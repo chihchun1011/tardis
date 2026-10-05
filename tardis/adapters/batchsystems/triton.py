@@ -4,8 +4,11 @@ from ...utilities.asynccachemap import AsyncCacheMap
 from ...utilities.executors.shellexecutor import ShellExecutor
 
 import hashlib
+import json
 import logging
+import os
 import asyncio
+import tempfile
 from typing import Iterable
 
 import aiohttp
@@ -30,8 +33,16 @@ class TritonAdapter(BatchSystemAdapter):
           max_age: 1           # cache TTL in minutes
           triton_http_port: 8000
           triton_metrics_port: 8002
+          discovery_file: /srv/triton-discovery/endpoints.json  # optional
           options:
             pool: c03-001-151.gridka.de
+
+    discovery_file is optional. When set, every host-cache refresh also
+    writes the current drone_uuid -> host/port mapping to this path as
+    JSON, atomically (temp file + rename), so external consumers such as
+    Prometheus (file_sd_config) or Envoy (filesystem-based EDS) can find
+    live Triton endpoints without talking to condor_q or TARDIS directly.
+    Leave unset to skip this (no discovery file is written).
 
     triton_http_port/triton_metrics_port are BASE ports, not literal ones.
     Multiple pilots can land on the same GPU node, so each drone's actual
@@ -58,6 +69,11 @@ class TritonAdapter(BatchSystemAdapter):
         self._http_port = getattr(config.BatchSystem, "triton_http_port", 8000)
         self._metrics_port = getattr(config.BatchSystem, "triton_metrics_port", 8002)
         max_age = getattr(config.BatchSystem, "max_age", 1)  # minutes
+
+        # Optional: path to export the live drone_uuid -> host/port mapping
+        # to, as JSON, for external consumers (Prometheus, Envoy). Unset by
+        # default so existing deployments see no behaviour change.
+        self._discovery_file = getattr(config.BatchSystem, "discovery_file", None)
 
         # Testing-only escape hatch: if set, get_utilisation() reads a float
         # from this file instead of querying Triton's real /metrics, so
@@ -136,10 +152,55 @@ class TritonAdapter(BatchSystemAdapter):
             # "slot1@gpu-node-42.gridka.de" → "gpu-node-42.gridka.de"
             hostname = remote_host.split("@")[-1]
             host_map[drone_uuid] = hostname
-            logger.debug(f"Mapped drone {drone_uuid} → {hostname}")
+            offset = self._port_offset(drone_uuid)
+            logger.debug(
+                f"Mapped drone {drone_uuid} → {hostname} "
+                f"(http={self._http_port + offset}, metrics={self._metrics_port + offset})"
+            )
 
         logger.debug(f"Host cache updated: {len(host_map)} entries")
+        self._export_discovery_file(host_map)
         return host_map
+
+    def _export_discovery_file(self, host_map: dict[str, str]) -> None:
+        """
+        Write the current drone_uuid → host/port mapping to self._discovery_file
+        as JSON, so external consumers (Prometheus file_sd_config, Envoy
+        filesystem-based EDS) can discover live Triton endpoints without
+        querying condor_q or TARDIS themselves. No-op if discovery_file isn't
+        configured.
+
+        Written atomically (temp file + os.replace) so a reader never sees a
+        half-written file mid-update - file_sd/EDS watchers poll for changes
+        at arbitrary times, including while this write is in progress.
+        """
+        if self._discovery_file is None:
+            return
+
+        entries = [
+            {
+                "drone_uuid": drone_uuid,
+                "host": host,
+                "http_port": self._http_port + self._port_offset(drone_uuid),
+                "metrics_port": self._metrics_port + self._port_offset(drone_uuid),
+            }
+            for drone_uuid, host in host_map.items()
+        ]
+
+        directory = os.path.dirname(self._discovery_file) or "."
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=directory, prefix=".triton_discovery_", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                json.dump(entries, f, indent=2)
+            os.replace(tmp_path, self._discovery_file)
+        except OSError as e:
+            logger.warning(f"Could not write Triton discovery file {self._discovery_file}: {e}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     async def _get_host(self, drone_uuid: str) -> str | None:
         """
