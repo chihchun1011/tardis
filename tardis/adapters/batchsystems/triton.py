@@ -70,10 +70,18 @@ class TritonAdapter(BatchSystemAdapter):
         self._metrics_port = getattr(config.BatchSystem, "triton_metrics_port", 8002)
         max_age = getattr(config.BatchSystem, "max_age", 1)  # minutes
 
-        # Optional: path to export the live drone_uuid -> host/port mapping
-        # to, as JSON, for external consumers (Prometheus, Envoy). Unset by
-        # default so existing deployments see no behaviour change.
+        # Optional: path to export the live drone_uuid -> host/port mapping.
+        # Unset by default so existing deployments see no behaviour change.
         self._discovery_file = getattr(config.BatchSystem, "discovery_file", None)
+        if self._discovery_file is not None and not os.path.dirname(self._discovery_file):
+            # A bare filename (no directory component) would otherwise write
+            # silently into this process's current working directory.
+            logger.warning(
+                f"discovery_file={self._discovery_file!r} has no directory component - "
+                f"it will be written to this process's current working directory "
+                f"({os.getcwd()}) on every refresh. Use a path with an explicit "
+                f"directory (e.g. '/srv/triton-discovery/{self._discovery_file}') instead."
+            )
 
         # Testing-only escape hatch: if set, get_utilisation() reads a float
         # from this file instead of querying Triton's real /metrics, so
@@ -165,14 +173,14 @@ class TritonAdapter(BatchSystemAdapter):
     def _export_discovery_file(self, host_map: dict[str, str]) -> None:
         """
         Write the current drone_uuid → host/port mapping to self._discovery_file
-        as JSON, so external consumers (Prometheus file_sd_config, Envoy
-        filesystem-based EDS) can discover live Triton endpoints without
-        querying condor_q or TARDIS themselves. No-op if discovery_file isn't
-        configured.
+        as JSON for external consumers. No-op if discovery_file isn't configured.
 
-        Written atomically (temp file + os.replace) so a reader never sees a
-        half-written file mid-update - file_sd/EDS watchers poll for changes
-        at arbitrary times, including while this write is in progress.
+        Two files are written: prometheus_targets.json and endpoints.json for scripts/Envoy.
+
+        Both are written atomically (temp file + os.replace) so a reader
+        never sees a half-written file mid-update - file_sd/EDS watchers
+        poll for changes at arbitrary times, including while this write is
+        in progress.
         """
         if self._discovery_file is None:
             return
@@ -186,21 +194,42 @@ class TritonAdapter(BatchSystemAdapter):
             }
             for drone_uuid, host in host_map.items()
         ]
+        self._atomic_write_json(self._discovery_file, entries)
 
-        directory = os.path.dirname(self._discovery_file) or "."
-        tmp_fd, tmp_path = tempfile.mkstemp(
-            dir=directory, prefix=".triton_discovery_", suffix=".tmp"
+        prometheus_targets = [
+            {
+                "targets": [f"{entry['host']}:{entry['metrics_port']}"],
+                "labels": {"drone_uuid": entry["drone_uuid"]},
+            }
+            for entry in entries
+        ]
+        prometheus_file = os.path.join(
+            os.path.dirname(self._discovery_file) or ".", "prometheus_targets.json"
         )
+        self._atomic_write_json(prometheus_file, prometheus_targets)
+
+    @staticmethod
+    def _atomic_write_json(path: str, data) -> None:
+        directory = os.path.dirname(path) or "."
+        tmp_path = None
         try:
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=directory, prefix=".triton_discovery_", suffix=".tmp"
+            )
             with os.fdopen(tmp_fd, "w") as f:
-                json.dump(entries, f, indent=2)
-            os.replace(tmp_path, self._discovery_file)
+                json.dump(data, f, indent=2)
+            # mkstemp creates the file mode 0600 (owner-only) by default -
+            # too restrictive for external readers (e.g. Prometheus, running
+            # as a different uid in its own container) to open it at all.
+            os.chmod(tmp_path, 0o644)
+            os.replace(tmp_path, path)
         except OSError as e:
-            logger.warning(f"Could not write Triton discovery file {self._discovery_file}: {e}")
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+            logger.warning(f"Could not write {path}: {e}")
+            if tmp_path is not None:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     async def _get_host(self, drone_uuid: str) -> str | None:
         """
