@@ -32,6 +32,7 @@ class TritonAdapter(BatchSystemAdapter):
           adapter: TritonAdapter
           max_age: 1           # cache TTL in minutes
           triton_http_port: 8000
+          triton_grpc_port: 8001
           triton_metrics_port: 8002
           discovery_file: /srv/triton-discovery/endpoints.json  # optional
           options:
@@ -44,13 +45,16 @@ class TritonAdapter(BatchSystemAdapter):
     live Triton endpoints without talking to condor_q or TARDIS directly.
     Leave unset to skip this (no discovery file is written).
 
-    triton_http_port/triton_metrics_port are BASE ports, not literal ones.
-    Multiple pilots can land on the same GPU node, so each drone's actual
-    ports are base + a stable per-drone offset derived from its
-    TardisDroneUuid (see _port_offset). start_pilot.sh derives the same
-    offset from the same UUID to pick tritonserver's --http-port/
-    --grpc-port/--metrics-port, so the two sides always agree without any
-    extra coordination.
+    triton_http_port/triton_grpc_port/triton_metrics_port are BASE ports,
+    not literal ones. Multiple pilots can land on the same GPU node, so each
+    drone's actual ports are base + a stable per-drone offset derived from
+    its TardisDroneUuid (see _port_offset). start_pilot.sh derives the same
+    offset, so the two sides always agree without any extra coordination.
+
+    _ports() is the only place that turns a drone_uuid into ports. Every
+    port is written to the discovery file, so external consumers read them
+    from there and never re-derive them - the port scheme can then change
+    here (and in start_pilot.sh) without touching any consumer.
     """
 
     PORT_OFFSET_RANGE = 10000
@@ -67,6 +71,7 @@ class TritonAdapter(BatchSystemAdapter):
             self._pool_flag = ""
 
         self._http_port = getattr(config.BatchSystem, "triton_http_port", 8000)
+        self._grpc_port = getattr(config.BatchSystem, "triton_grpc_port", 8001)
         self._metrics_port = getattr(config.BatchSystem, "triton_metrics_port", 8002)
         max_age = getattr(config.BatchSystem, "max_age", 1)  # minutes
 
@@ -160,11 +165,7 @@ class TritonAdapter(BatchSystemAdapter):
             # "slot1@gpu-node-42.gridka.de" → "gpu-node-42.gridka.de"
             hostname = remote_host.split("@")[-1]
             host_map[drone_uuid] = hostname
-            offset = self._port_offset(drone_uuid)
-            logger.debug(
-                f"Mapped drone {drone_uuid} → {hostname} "
-                f"(http={self._http_port + offset}, metrics={self._metrics_port + offset})"
-            )
+            logger.debug(f"Mapped drone {drone_uuid} → {hostname} {self._ports(drone_uuid)}")
 
         logger.debug(f"Host cache updated: {len(host_map)} entries")
         self._export_discovery_file(host_map)
@@ -186,12 +187,7 @@ class TritonAdapter(BatchSystemAdapter):
             return
 
         entries = [
-            {
-                "drone_uuid": drone_uuid,
-                "host": host,
-                "http_port": self._http_port + self._port_offset(drone_uuid),
-                "metrics_port": self._metrics_port + self._port_offset(drone_uuid),
-            }
+            {"drone_uuid": drone_uuid, "host": host, **self._ports(drone_uuid)}
             for drone_uuid, host in host_map.items()
         ]
         self._atomic_write_json(self._discovery_file, entries)
@@ -250,6 +246,17 @@ class TritonAdapter(BatchSystemAdapter):
         digest = hashlib.md5(drone_uuid.encode()).hexdigest()[:8]
         return int(digest, 16) % cls.PORT_OFFSET_RANGE
 
+    def _ports(self, drone_uuid: str) -> dict[str, int]:
+        """
+        All ports a drone's Triton listens on.
+        """
+        offset = self._port_offset(drone_uuid)
+        return {
+            "http_port": self._http_port + offset,
+            "grpc_port": self._grpc_port + offset,
+            "metrics_port": self._metrics_port + offset,
+        }
+
     # ------------------------------------------------------------------
     # BatchSystemAdapter interface implementation
     # ------------------------------------------------------------------
@@ -281,7 +288,7 @@ class TritonAdapter(BatchSystemAdapter):
             logger.debug(f"No host found for {drone_uuid}, returning utilisation 0.0")
             return 0.0
 
-        url = f"http://{host}:{self._metrics_port + self._port_offset(drone_uuid)}/metrics"
+        url = f"http://{host}:{self._ports(drone_uuid)['metrics_port']}/metrics"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -302,7 +309,7 @@ class TritonAdapter(BatchSystemAdapter):
         if host is None:
             return 0.0
 
-        url = f"http://{host}:{self._http_port + self._port_offset(drone_uuid)}/v2/health/ready"
+        url = f"http://{host}:{self._ports(drone_uuid)['http_port']}/v2/health/ready"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
