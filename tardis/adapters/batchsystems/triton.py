@@ -265,11 +265,6 @@ class TritonAdapter(BatchSystemAdapter):
         """
         GPU utilisation from Triton's Prometheus /metrics endpoint.
         Returns 0.0 if the drone is unreachable (not yet ready, or gone).
-
-        nv_gpu_utilization is a value between 0.0 and 1.0 reported by Triton.
-        TARDIS uses this to decide whether to scale up or down:
-          - utilisation < low_utilisation  → scale down (drone underused)
-          - utilisation > high_allocation  → scale up   (drone overloaded)
         """
         if self._simulated_utilisation_file is not None:
             try:
@@ -302,21 +297,26 @@ class TritonAdapter(BatchSystemAdapter):
 
     async def get_allocation(self, drone_uuid: str) -> float:
         """
-        A Triton server is either running (allocation=1.0) or not (0.0).
-        We check the /v2/health/ready endpoint.
+        GPU utilisation on a ready drone, 0.0 otherwise.
         """
+        if not await self._is_ready(drone_uuid):
+            return 0.0
+        return await self.get_utilisation(drone_uuid)
+
+    async def _is_ready(self, drone_uuid: str) -> bool:
+        """True if the drone's Triton answers /v2/health/ready with 200."""
         host = await self._get_host(drone_uuid)
         if host is None:
-            return 0.0
+            return False
 
         url = f"http://{host}:{self._ports(drone_uuid)['http_port']}/v2/health/ready"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    return 1.0 if resp.status == 200 else 0.0
+                    return resp.status == 200
         except Exception as e:
             logger.debug(f"Triton not ready for {drone_uuid} at {url}: {e}")
-            return 0.0
+            return False
 
     async def get_machine_status(self, drone_uuid: str) -> MachineStatus:
         """
@@ -328,8 +328,7 @@ class TritonAdapter(BatchSystemAdapter):
         if drone_uuid in self._draining:
             return MachineStatus.Drained
 
-        allocation = await self.get_allocation(drone_uuid)
-        if allocation == 1.0:
+        if await self._is_ready(drone_uuid):
             return MachineStatus.Available
         return MachineStatus.NotAvailable
 
